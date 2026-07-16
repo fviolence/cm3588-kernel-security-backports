@@ -1,0 +1,69 @@
+From b3e7e496b95666b1b3885a565e774b2464ee16cf Mon Sep 17 00:00:00 2001
+From: brown25 <asetium@gmail.com>
+Date: Thu, 16 Jul 2026 11:11:58 +0000
+Subject: [PATCH] rxrpc: Also unshare DATA packets when paged frags are present
+
+CVE-2026-43500 affects encrypted RxRPC packets that carry a frag list
+or externally owned paged fragments.  Such an skb may not be cloned,
+so skb_unshare() can return the original skb even though RxKAD will
+subsequently bind its fragment pages into a scatterlist and decrypt
+them in place.
+
+This tree predates the newer rxrpc_input_call_event() structure.  Its
+equivalent encrypted DATA handling is in rxrpc_input_packet() in
+net/rxrpc/input.c, where skb_unshare() is called before the packet is
+passed to the RxKAD verification path.
+
+Force a full skb_copy() when skb_has_frag_list() or
+skb_has_shared_frag() is true.  Preserve the ownership semantics of
+skb_unshare() by consuming the original skb on success and freeing it
+on allocation failure.  The existing RxRPC skb tracing and
+out-of-memory handling are then reused unchanged.
+
+This adapts upstream commit aa54b1d27fe0c2b78e664a34fd0fdf7cd1960d71
+("rxrpc: Also unshare DATA/RESPONSE packets when paged frags are
+present") to the older RxRPC architecture.
+
+The RESPONSE part of the upstream change is not required in this tree.
+rxkad_verify_response() copies the response structure and ticket out
+of the skb with skb_copy_bits() and performs decryption on those
+private allocations rather than decrypting the RESPONSE skb or its
+fragments in place.
+
+The zero-copy path remains unchanged for encrypted DATA skbs whose
+fragments are private to the kernel.
+
+Fixes: d0d5c0cd1e71 ("rxrpc: Use skb_unshare() rather than skb_cow_data()")
+CVE: CVE-2026-43500
+Signed-off-by: brown25 <asetium@gmail.com>
+---
+ net/rxrpc/input.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/net/rxrpc/input.c b/net/rxrpc/input.c
+index 721d847ba..99c4a1969 100644
+--- a/net/rxrpc/input.c
++++ b/net/rxrpc/input.c
+@@ -1314,7 +1314,18 @@ int rxrpc_input_packet(struct sock *udp_sk, struct sk_buff *skb)
+ 		 * decryption.
+ 		 */
+ 		if (sp->hdr.securityIndex != 0) {
+-			struct sk_buff *nskb = skb_unshare(skb, GFP_ATOMIC);
++			struct sk_buff *nskb;
++
++			if (skb_has_frag_list(skb) || skb_has_shared_frag(skb)) {
++				nskb = skb_copy(skb, GFP_ATOMIC);
++				if (likely(nskb))
++					consume_skb(skb);
++				else
++					kfree_skb(skb);
++			} else {
++				nskb = skb_unshare(skb, GFP_ATOMIC);
++			}
++
+ 			if (!nskb) {
+ 				rxrpc_eaten_skb(skb, rxrpc_skb_unshared_nomem);
+ 				goto out;
+-- 
+2.25.1
+

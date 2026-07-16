@@ -1,0 +1,70 @@
+From db134ee24721e7a6c71537b2e6658899fd82b90b Mon Sep 17 00:00:00 2001
+From: brown25 <asetium@gmail.com>
+Date: Mon, 20 Jul 2026 10:45:40 +0200
+Subject: [PATCH 1/2] locking/rtmutex: Skip remove_waiter() when waiter is not
+ enqueued
+
+CVE-2026-53163 is a regression introduced by commit 3bfdc63936dd
+("rtmutex: Use waiter::task instead of current in remove_waiter()"),
+which was backported to fix CVE-2026-43499.
+
+During FUTEX_CMP_REQUEUE_PI, task_blocks_on_rt_mutex() can detect a
+deadlock before the waiter is enqueued.  In that case waiter->task
+remains NULL.  Calling remove_waiter() then dereferences waiter->task
+while attempting to acquire its pi_lock, resulting in a locally
+triggerable NULL pointer dereference and kernel crash.
+
+Return from remove_waiter() when waiter->task is NULL, as such a waiter
+was never enqueued and there is no state to remove.
+
+Also tighten the return-value check in rt_mutex_start_proxy_lock().
+A positive return value means that try_to_take_rt_mutex() successfully
+acquired the mutex; it is not an error and no waiter needs to be
+removed.  Call remove_waiter() only for negative error returns.
+
+This adapts upstream commit
+40a25d59e85b3c8709ac2424d44f65610467871e
+("locking/rtmutex: Skip remove_waiter() when waiter is not enqueued")
+to the older rtmutex proxy-lock API in the FriendlyElec 6.1.141 tree,
+where __rt_mutex_start_proxy_lock() does not take a wake_q argument and
+the wrapper does not contain the newer wake-queue and preemption
+handling.
+
+Fixes: 3bfdc63936dd ("rtmutex: Use waiter::task instead of current in remove_waiter()")
+CVE: CVE-2026-53163
+Signed-off-by: brown25 <asetium@gmail.com>
+---
+ kernel/locking/rtmutex.c     | 3 +++
+ kernel/locking/rtmutex_api.c | 2 +-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
+index f52fda51eea4..bc312e38076d 100644
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@ -1475,6 +1475,9 @@ static void __sched remove_waiter(struct rt_mutex_base *lock,
+ 
+ 	lockdep_assert_held(&lock->wait_lock);
+ 
++	if (!waiter_task) /* never enqueued */
++		return;
++
+ 	scoped_guard(raw_spinlock, &waiter_task->pi_lock) {
+ 		rt_mutex_dequeue(lock, waiter);
+ 		waiter_task->pi_blocked_on = NULL;
+diff --git a/kernel/locking/rtmutex_api.c b/kernel/locking/rtmutex_api.c
+index ea1caa87bb70..35834240415a 100644
+--- a/kernel/locking/rtmutex_api.c
++++ b/kernel/locking/rtmutex_api.c
+@@ -349,7 +349,7 @@ int __sched rt_mutex_start_proxy_lock(struct rt_mutex_base *lock,
+ 
+ 	raw_spin_lock_irq(&lock->wait_lock);
+ 	ret = __rt_mutex_start_proxy_lock(lock, waiter, task);
+-	if (unlikely(ret))
++	if (unlikely(ret < 0))
+ 		remove_waiter(lock, waiter);
+ 	raw_spin_unlock_irq(&lock->wait_lock);
+ 
+-- 
+2.55.0
+
